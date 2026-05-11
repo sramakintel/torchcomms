@@ -14,9 +14,11 @@
 #include "comms/utils/CommsMaybeChecks.h"
 #include "comms/utils/GpuClockCalibration.h"
 #include "comms/utils/checks.h"
+#include "comms/utils/colltrace/CudaWaitEvent.h"
 #include "comms/utils/colltrace/GraphCollTraceHandle.h"
 #include "comms/utils/colltrace/GraphCollTraceState.h"
 #include "comms/utils/colltrace/GraphCudaWaitEvent.h"
+#include "comms/utils/colltrace/PrecisionClock.h"
 #include "comms/utils/cvars/nccl_cvars.h"
 
 namespace meta::comms::colltrace {
@@ -149,7 +151,10 @@ std::shared_ptr<GraphCollTraceState> CollTrace::getOrCreateGraphState(
   unsigned long long graphId = 0;
   cudaGraph_t graph = nullptr;
 
-#if CUDART_VERSION >= 13000
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  auto res = hipStreamGetCaptureInfo_v2(
+      stream, &captureStatus, &graphId, &graph, nullptr, nullptr);
+#elif CUDART_VERSION >= 13000
   auto res = cudaStreamGetCaptureInfo(
       stream, &captureStatus, &graphId, &graph, nullptr, nullptr, nullptr);
 #else
@@ -282,8 +287,7 @@ CommsMaybeVoid CollTrace::triggerEventState(
       triggerPlugins<&ICollTracePlugin::afterCollKernelScheduled>(
           plugins_, collEvent); // Trigger plugins before calling waitEvent
       EXPECT_CHECK(collEvent.waitEvent->afterCollKernelScheduled());
-      collEvent.collRecord->getTimingInfo().setCollEnqueueTs(
-          std::chrono::system_clock::now());
+      collEvent.collRecord->getTimingInfo().setCollEnqueueTs(precisionNow());
       if (pendingTraceColls_.write(std::move(pendingEnqueueColl_))) {
         return folly::unit;
         // If the write fails, pendingEnqueueColl_ will not be moved. Do a
@@ -483,7 +487,7 @@ void CollTrace::pollGraphEvents(
   // timer accumulates. Without this, graph collectives would never trigger
   // the watchdog timeout because collEventProgressing is only called on
   // discrete ring buffer events.
-  auto now = std::chrono::system_clock::now();
+  auto now = precisionNow();
   for (auto collId : progressingGraphCollectives_) {
     auto it = collIdMap_.find(collId);
     if (it != collIdMap_.end()) {
@@ -522,7 +526,7 @@ void CollTrace::pollEagerEvents(
 
     if (!started) {
       if (event->waitEvent->waitCollStart(kPollTimeout).value_or(false)) {
-        auto now = std::chrono::system_clock::now();
+        auto now = precisionNow();
         auto startTimeRes = event->waitEvent->getCollStartTime();
         auto startTs = startTimeRes.hasValue() ? startTimeRes.value() : now;
         timing.setCollStartTs(startTs);
@@ -532,24 +536,20 @@ void CollTrace::pollEagerEvents(
         // Fire progressing even before start so the watchdog plugin can
         // detect pre-start timeouts and async errors.
         actions.insert(
-            {event.get(),
-             PendingActionType::kProgressing,
-             std::chrono::system_clock::now()});
+            {event.get(), PendingActionType::kProgressing, precisionNow()});
       }
     }
 
     if (started && !ended) {
       if (event->waitEvent->waitCollEnd(kPollTimeout).value_or(false)) {
-        auto now = std::chrono::system_clock::now();
+        auto now = precisionNow();
         auto endTimeRes = event->waitEvent->getCollEndTime();
         auto endTs = endTimeRes.hasValue() ? endTimeRes.value() : now;
         timing.setCollEndTs(endTs);
         actions.insert({event.get(), PendingActionType::kEnd, endTs});
       } else {
         actions.insert(
-            {event.get(),
-             PendingActionType::kProgressing,
-             std::chrono::system_clock::now()});
+            {event.get(), PendingActionType::kProgressing, precisionNow()});
       }
     }
   }
@@ -638,7 +638,36 @@ void CollTrace::collTraceThread(
 
   bool initialized = false;
 
+  // Periodic re-anchor of the GPU-time ↔ wall-clock mappings. Bounds
+  // residual drift between anchors to ~kReanchorInterval × oscillator-ppm
+  // (≤ ~100 ns at 1 s and 100 ppm).
+  //
+  // Two independent anchors live behind this:
+  //   - GlobaltimerCalibration: %globaltimer (graph mode). Refreshed only
+  //     when this CollTrace has graph mode enabled (ringBuffer_).
+  //   - CudaReferencePoint: cudaEventElapsedTime baseline (eager mode).
+  //     Refreshed only if some CudaWaitEvent has ever been created — we
+  //     check via CudaReferencePoint::tryGet() to avoid forcing CUDA init
+  //     in CPU-only colltrace deployments.
+  // Gated on NCCL_COLLTRACE_PERIODIC_REANCHOR (default false) — issuing CUDA
+  // calls from this thread has been observed to hang some training jobs.
+  constexpr auto kReanchorInterval = std::chrono::seconds(1);
+  auto lastReanchor = std::chrono::steady_clock::now();
+
   while (!isThreadCancelled()) {
+    if (NCCL_COLLTRACE_PERIODIC_REANCHOR) {
+      auto now = std::chrono::steady_clock::now();
+      if (now - lastReanchor >= kReanchorInterval) {
+        if (ringBuffer_.has_value()) {
+          GlobaltimerCalibration::get().refresh();
+        }
+        if (auto* refpt = CudaReferencePoint::tryGet()) {
+          refpt->refresh();
+        }
+        lastReanchor = now;
+      }
+    }
+
     std::multiset<PendingAction> actions;
 
     pollGraphEvents(actions);
